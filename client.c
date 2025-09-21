@@ -1,6 +1,7 @@
 #include <stddef.h>
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,15 +19,52 @@ static void *get_in_addr(struct sockaddr *sa) {
   return &(((struct sockaddr_in6 *)sa)->sin6_addr);
 }
 
+static ssize_t sendall(int fd, const void *buf, size_t len) {
+  const char *p = buf;
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(fd, p + sent, len - sent, 0);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    sent += (size_t)n;
+  }
+  return (ssize_t)sent;
+}
+
+static ssize_t recvline(int fd, char *buf, size_t cap) {
+  size_t used = 0;
+  while (used + 1 < cap) {
+    char c;
+    ssize_t n = recv(fd, &c, 1, 0);
+    if (n == 0) { // server closed
+      if (used == 0)
+        return 0; // no data read
+      break;      // return what we have
+    }
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    buf[used++] = c;
+    if (c == '\n')
+      break; // stop at end of line
+  }
+  buf[used] = '\0';
+  return (ssize_t)used;
+}
+
 int main(int argc, char **argv) {
-  if (argc < 3) {
-    fprintf(stderr, "Usage: %s <hostname> <port> [message]\n", argv[0]);
+  if (argc < 2) {
+    fprintf(stderr, "Usage: %s <hostname> <port> \n", argv[0]);
     return 1;
   }
 
   const char *host = argv[1];
   const char *port = argv[2];
-  const char *msg = argv[3];
 
   struct addrinfo hints, *res, *p;
   char s[INET6_ADDRSTRLEN];
@@ -75,24 +113,34 @@ int main(int argc, char **argv) {
 
   freeaddrinfo(res);
 
-  size_t len = strlen(msg);
-  if (send(sockfd, msg, len, 0) != (ssize_t)len) {
-    perror("send");
-    close(sockfd);
-    return 1;
+  char line[4096];
+  char reply[4096];
+
+  while (1) {
+    // read a line from stdin
+    if (!fgets(line, sizeof line, stdin)) {
+      break;
+    }
+
+    // send that while line to server
+    size_t len = strlen(line);
+    if (sendall(sockfd, line, len) < 0) {
+      perror("send");
+      break;
+    }
+
+    // read exactly one respone line and print it
+    ssize_t r = recvline(sockfd, reply, sizeof reply);
+    if (r == 0) {
+      printf("server closed\n");
+      break;
+    }
+    if (r < 0) {
+      perror("recv");
+      break;
+    }
+    fputs(reply, stdout);
   }
-
-  char buf[BUFSZ];
-  ssize_t n = recv(sockfd, buf, sizeof buf - 1, 0);
-  if (n < 0) {
-    perror("recv");
-    close(sockfd);
-    return 1;
-  }
-
-  buf[n] = '\0';
-
-  printf("\"%s\"\n", buf);
 
   close(sockfd);
 

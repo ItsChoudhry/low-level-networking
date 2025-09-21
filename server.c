@@ -1,3 +1,4 @@
+#include <stddef.h>
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
@@ -33,6 +34,29 @@ static void sigchld_handler(int s) {
   errno = saved_errno;
 }
 
+static ssize_t sendall(int fd, const void *buf, size_t len) {
+  const char *p = buf;
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(fd, p + sent, len - sent, 0);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    sent += (size_t)n;
+  }
+
+  return (ssize_t)sent;
+}
+
+static void rstrip_crlf(char *s) {
+  size_t n = strlen(s);
+  while (n && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+    s[--n] = '\0';
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr, "Usage: %s <port>\n", argv[0]);
@@ -66,14 +90,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  for (p = res; res != NULL; res = res->ai_next) {
+  for (p = res; res != NULL; p = p->ai_next) {
     sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
     if (sockfd == -1) {
       perror("socket");
       continue;
     }
 
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes)) {
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1) {
       perror("setsockopt");
       close(sockfd);
       freeaddrinfo(res);
@@ -116,11 +140,11 @@ int main(int argc, char **argv) {
     }
 
     inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
-    printf("server: geto connection from %s\n", s);
+    printf("server: got connection from %s\n", s);
 
     pid_t pid = fork();
     if (pid == -1) {
-      perror("for");
+      perror("fork");
       close(new_fd);
       continue;
     }
@@ -128,33 +152,51 @@ int main(int argc, char **argv) {
     if (pid == 0) {
       close(sockfd);
 
-      char buf[BUFSZ];
+      char inbuf[BUFSZ];
+      char linebuf[BUFSZ * 2];
+      size_t line_len = 0;
       while (1) {
-        ssize_t n = recv(new_fd, buf, sizeof buf, 0);
-        if (n == 0) {
+        ssize_t r = recv(new_fd, inbuf, sizeof inbuf, 0);
+        if (r == 0) {
           break;
-        } else if (n < 0) {
+        } else if (r < 0) {
           if (errno == EINTR)
             continue;
           perror("recv");
           break;
         }
-        buf[n] = '\0';
 
-        printf("server recv: %s\n", buf);
-
-        char response[BUFSZ + 64];
-        int m = snprintf(response, sizeof response, "Broadcast: %s", buf);
-
-        if (m > 0) {
-          ssize_t sent = 0;
-          while (sent < m) {
-            ssize_t k = send(new_fd, response + sent, (size_t)(m - sent), 0);
-            if (k < 0) {
-              perror("sent");
-              break;
+        size_t off = 0;
+        while (off < (size_t)r) {
+          // copy byte by byte until newline or buffers fill
+          if (line_len < sizeof linebuf - 1) {
+            linebuf[line_len++] = inbuf[off++];
+            linebuf[line_len] = '\0';
+          } else {
+            // line too long flush/reset with an error prefix
+            const char *msg = "error: line too long \n";
+            if (sendall(new_fd, msg, strlen(msg)) < 0)
+              perror("send");
+            line_len = 0;
+            // skip remaining butes until newline
+            while (off < (size_t)r && inbuf[off++] != '\n') {
             }
-            sent += k;
+          }
+
+          // get a full line?
+          if (line_len && linebuf[line_len - 1] == '\n') {
+            rstrip_crlf(linebuf);
+            // build response: "Broadcast: <line>\n
+            char response[BUFSZ + 128];
+            int m = snprintf(response, sizeof response, "Broadcast: %s\n", linebuf);
+
+            if (m > 0) {
+              if (sendall(new_fd, response, (size_t)m) < 0) {
+                perror("send");
+                break;
+              }
+            }
+            line_len = 0;
           }
         }
       }
