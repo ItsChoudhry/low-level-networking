@@ -1,13 +1,14 @@
-#include <stddef.h>
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -15,13 +16,6 @@
 
 #define BACKLOG 10
 #define BUFSZ 4096
-
-static void *get_in_addr(struct sockaddr *sa) {
-  if (sa->sa_family == AF_INET) {
-    return &(((struct sockaddr_in *)sa)->sin_addr);
-  }
-  return &(((struct sockaddr_in6 *)sa)->sin6_addr);
-}
 
 static void sigchld_handler(int s) {
   (void)s;
@@ -57,6 +51,21 @@ static void rstrip_crlf(char *s) {
   }
 }
 
+struct client_state {
+  int fd;
+  char linebuf[BUFSZ * 2];
+  size_t line_len;
+};
+
+static struct client_state clients[FD_SETSIZE];
+
+static void clients_init(void) {
+  for (int i = 0; i < FD_SETSIZE; ++i) {
+    clients[i].fd = -1;
+    clients[i].line_len = 0;
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr, "Usage: %s <port>\n", argv[0]);
@@ -64,12 +73,9 @@ int main(int argc, char **argv) {
   }
   const char *port = argv[1];
   struct addrinfo hints, *res, *p;
-  struct sockaddr_storage their_addr;
-  socklen_t sin_size;
   struct sigaction sa = {0};
-  char s[INET6_ADDRSTRLEN];
 
-  int sockfd, new_fd, status, yes = 1;
+  int sockfd, status, yes = 1;
 
   sa.sa_handler = sigchld_handler;
   sigemptyset(&sa.sa_mask);
@@ -129,81 +135,110 @@ int main(int argc, char **argv) {
 
   printf("server: Listening on port %s \n", argv[1]);
 
+  clients_init();
+
+  fd_set master, readfds;
+  FD_ZERO(&master);
+  FD_SET(sockfd, &master); // watch the listening socket
+  int fdmax = sockfd;      // highest-numbered fd we know about
+
   while (1) {
-    sin_size = sizeof their_addr;
-    new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
-    if (new_fd == -1) {
-      if (errno == EINTR)
+    readfds = master;
+    int nready = select(fdmax + 1, &readfds, NULL, NULL, NULL);
+    if (nready < 0) {
+      if (errno == EINTR) {
+        perror("select");
+        break;
+      }
+    }
+
+    if (FD_ISSET(sockfd, &readfds)) { // if sockfd is readable? as in is there a client pending
+      struct sockaddr_storage ss;
+      socklen_t slen = sizeof ss;
+      int new_fd = accept(sockfd, (struct sockaddr *)&ss, &slen);
+      if (new_fd != -1) {
+        clients[new_fd].fd = new_fd;
+        clients[new_fd].line_len = 0;
+
+        FD_SET(new_fd, &master);
+        if (new_fd > fdmax)
+          fdmax = new_fd;
+
+        const char *banner = "Welcome!\n";
+        send(new_fd, banner, strlen(banner), 0);
+      }
+      if (--nready == 0) {
         continue;
-      perror("accept");
-      continue;
+      }
     }
 
-    inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
-    printf("server: got connection from %s\n", s);
-
-    pid_t pid = fork();
-    if (pid == -1) {
-      perror("fork");
-      close(new_fd);
-      continue;
-    }
-
-    if (pid == 0) {
-      close(sockfd);
+    for (int fd = 0; fd <= fdmax && nready > 0; ++fd) {
+      if (fd == sockfd)
+        continue;
+      if (clients[fd].fd == -1)
+        continue;
+      if (!FD_ISSET(fd, &readfds))
+        continue;
+      --nready;
 
       char inbuf[BUFSZ];
-      char linebuf[BUFSZ * 2];
-      size_t line_len = 0;
-      while (1) {
-        ssize_t r = recv(new_fd, inbuf, sizeof inbuf, 0);
-        if (r == 0) {
-          break;
-        } else if (r < 0) {
-          if (errno == EINTR)
-            continue;
+      ssize_t r = recv(fd, inbuf, sizeof inbuf, 0);
+
+      if (r == 0) {
+        close(fd);
+        FD_CLR(fd, &master);
+        clients[fd].fd = -1;
+        clients[fd].line_len = 0;
+        continue;
+      }
+      if (r < 0) {
+        if (errno == EINTR) {
           perror("recv");
-          break;
-        }
-
-        size_t off = 0;
-        while (off < (size_t)r) {
-          // copy byte by byte until newline or buffers fill
-          if (line_len < sizeof linebuf - 1) {
-            linebuf[line_len++] = inbuf[off++];
-            linebuf[line_len] = '\0';
-          } else {
-            // line too long flush/reset with an error prefix
-            const char *msg = "error: line too long \n";
-            if (sendall(new_fd, msg, strlen(msg)) < 0)
-              perror("send");
-            line_len = 0;
-            // skip remaining butes until newline
-            while (off < (size_t)r && inbuf[off++] != '\n') {
-            }
-          }
-
-          // get a full line?
-          if (line_len && linebuf[line_len - 1] == '\n') {
-            rstrip_crlf(linebuf);
-            // build response: "Broadcast: <line>\n
-            char response[BUFSZ + 128];
-            int m = snprintf(response, sizeof response, "Broadcast: %s\n", linebuf);
-
-            if (m > 0) {
-              if (sendall(new_fd, response, (size_t)m) < 0) {
-                perror("send");
-                break;
-              }
-            }
-            line_len = 0;
-          }
+          close(fd);
+          FD_CLR(fd, &master);
+          clients[fd].fd = -1;
+          clients[fd].line_len = 0;
+          continue;
         }
       }
-      close(new_fd);
-      _exit(0);
-    } else {
-      close(new_fd);
+
+      size_t off = 0;
+      while (off < (size_t)r) {
+        if (clients[fd].line_len < sizeof(clients[fd].linebuf) - 1) {
+          clients[fd].linebuf[clients[fd].line_len++] = inbuf[off++];
+          clients[fd].linebuf[clients[fd].line_len] = '\0';
+        } else {
+          // too long: notify & skip to next newline
+          const char *msg = "error: line too long\n";
+          if (sendall(fd, msg, strlen(msg)) < 0)
+            perror("send");
+          clients[fd].line_len = 0;
+          // skip remaining bytes until newline
+          while (off < (size_t)r && inbuf[off++] != '\n') {
+          }
+        }
+
+        if (clients[fd].line_len && clients[fd].linebuf[clients[fd].line_len - 1] == '\n') {
+          rstrip_crlf(clients[fd].linebuf);
+
+          printf("%d: \"%s\"\n", fd, clients[fd].linebuf);
+          fflush(stdout);
+
+          char out[BUFSZ + 128];
+          int m = snprintf(out, sizeof out, "Broadcast: %s\n", clients[fd].linebuf);
+          if (m > 0) {
+            if (send(fd, out, (size_t)m, 0) < 0) {
+              perror("send");
+              close(fd);
+              FD_CLR(fd, &master);
+              clients[fd].fd = -1;
+              clients[fd].line_len = 0;
+              break; // stop handling this fd this tick
+            }
+          }
+          clients[fd].line_len = 0; // ready for next line
+        }
+      }
     }
   }
 }
