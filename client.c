@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -32,29 +33,6 @@ static ssize_t sendall(int fd, const void *buf, size_t len) {
     sent += (size_t)n;
   }
   return (ssize_t)sent;
-}
-
-static ssize_t recvline(int fd, char *buf, size_t cap) {
-  size_t used = 0;
-  while (used + 1 < cap) {
-    char c;
-    ssize_t n = recv(fd, &c, 1, 0);
-    if (n == 0) { // server closed
-      if (used == 0)
-        return 0; // no data read
-      break;      // return what we have
-    }
-    if (n < 0) {
-      if (errno == EINTR)
-        continue;
-      return -1;
-    }
-    buf[used++] = c;
-    if (c == '\n')
-      break; // stop at end of line
-  }
-  buf[used] = '\0';
-  return (ssize_t)used;
 }
 
 int main(int argc, char **argv) {
@@ -113,33 +91,53 @@ int main(int argc, char **argv) {
 
   freeaddrinfo(res);
 
-  char line[4096];
-  char reply[4096];
+  char in[4096];  // stdin
+  char out[4096]; // socket
 
   while (1) {
-    // read a line from stdin
-    if (!fgets(line, sizeof line, stdin)) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(0, &rfds);                         // monitor stdin
+    FD_SET(sockfd, &rfds);                    // monitor socket
+    int nfds = (sockfd > 0 ? sockfd : 0) + 1; // highest-numbered fd we know about
+
+    int n = select(nfds, &rfds, NULL, NULL, NULL);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("select");
       break;
     }
 
-    // send that while line to server
-    size_t len = strlen(line);
-    if (sendall(sockfd, line, len) < 0) {
-      perror("send");
-      break;
+    // typed something
+    if (FD_ISSET(0, &rfds)) {
+      if (!fgets(in, sizeof in, stdin)) {
+        break;
+      }
+      size_t len = strlen(in);
+      if (sendall(sockfd, in, len) < 0) {
+        perror("send");
+        break;
+      }
     }
 
-    // read exactly one respone line and print it
-    ssize_t r = recvline(sockfd, reply, sizeof reply);
-    if (r == 0) {
-      printf("server closed\n");
-      break;
+    // server sent something
+    if (FD_ISSET(sockfd, &rfds)) {
+      ssize_t r = recv(sockfd, out, sizeof out - 1, 0);
+      if (r == 0) {
+        fprintf(stderr, "(server closed)\n");
+        break;
+      }
+      if (r < 0) {
+        if (errno == EINTR)
+          continue;
+        perror("recv");
+        break;
+      }
+      out[r] = '\0';
+      fputs(out, stdout);
+      fflush(stdout);
     }
-    if (r < 0) {
-      perror("recv");
-      break;
-    }
-    fputs(reply, stdout);
   }
 
   close(sockfd);

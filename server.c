@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  for (p = res; res != NULL; p = p->ai_next) {
+  for (p = res; p != NULL; p = p->ai_next) {
     sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
     if (sockfd == -1) {
       perror("socket");
@@ -106,8 +106,7 @@ int main(int argc, char **argv) {
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1) {
       perror("setsockopt");
       close(sockfd);
-      freeaddrinfo(res);
-      return -1;
+      continue;
     }
 
     if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
@@ -146,10 +145,10 @@ int main(int argc, char **argv) {
     readfds = master;
     int nready = select(fdmax + 1, &readfds, NULL, NULL, NULL);
     if (nready < 0) {
-      if (errno == EINTR) {
-        perror("select");
-        break;
-      }
+      if (errno == EINTR)
+        continue;
+      perror("select");
+      break;
     }
 
     if (FD_ISSET(sockfd, &readfds)) { // if sockfd is readable? as in is there a client pending
@@ -192,14 +191,13 @@ int main(int argc, char **argv) {
         continue;
       }
       if (r < 0) {
-        if (errno == EINTR) {
-          perror("recv");
-          close(fd);
-          FD_CLR(fd, &master);
-          clients[fd].fd = -1;
-          clients[fd].line_len = 0;
+        if (errno == EINTR)
           continue;
-        }
+        perror("recv");
+        close(fd);
+        FD_CLR(fd, &master);
+        clients[fd].fd = -1;
+        clients[fd].line_len = 0;
       }
 
       size_t off = 0;
