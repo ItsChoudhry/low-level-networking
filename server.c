@@ -1,10 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
-#include <netinet/in.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,15 +18,17 @@
 #define BACKLOG 10
 #define BUFSZ 4096
 
-static void sigchld_handler(int s) {
-  (void)s;
+static volatile sig_atomic_t running = 1; // 1 = running, 0 = stop
+static int sigpipe_fds[2] = {-1, -1};     // [0]=read end, [1]=write end
 
-  int saved_errno = errno;
-
-  while (waitpid(-1, NULL, WNOHANG) > 0)
-    ;
-
-  errno = saved_errno;
+static void on_signal(int signo) {
+  (void)signo;
+  running = 0;
+  // wake select(): write one byte (async-signal-safe)
+  if (sigpipe_fds[1] != -1) {
+    const uint8_t b = 1;
+    (void)write(sigpipe_fds[1], &b, 1);
+  }
 }
 
 static ssize_t sendall(int fd, const void *buf, size_t len) {
@@ -73,17 +76,8 @@ int main(int argc, char **argv) {
   }
   const char *port = argv[1];
   struct addrinfo hints, *res, *p;
-  struct sigaction sa = {0};
 
   int sockfd, status, yes = 1;
-
-  sa.sa_handler = sigchld_handler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_RESTART;
-  if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-    perror("sigaction");
-    exit(1);
-  }
 
   memset(&hints, 0, sizeof hints);
   hints.ai_family = AF_UNSPEC;
@@ -134,12 +128,37 @@ int main(int argc, char **argv) {
 
   printf("server: Listening on port %s \n", argv[1]);
 
+  // create self-pipe
+  if (pipe(sigpipe_fds) == -1) {
+    perror("pipe");
+    return 1;
+  }
+
+  // make pipe nonblocking so repeated writes/reads never stall
+  fcntl(sigpipe_fds[0], F_SETFL, O_NONBLOCK);
+  fcntl(sigpipe_fds[1], F_SETFL, O_NONBLOCK);
+
+  // install signal handlers
+  struct sigaction sa = {0};
+  sa.sa_handler = on_signal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  if (sigaction(SIGINT, &sa, NULL) == -1) {
+    perror("sigaction SIGINT");
+  }
+  if (sigaction(SIGTERM, &sa, NULL) == -1) {
+    perror("sigaction SIGTERM");
+  }
+
   clients_init();
 
   fd_set master, readfds;
   FD_ZERO(&master);
   FD_SET(sockfd, &master); // watch the listening socket
-  int fdmax = sockfd;      // highest-numbered fd we know about
+  FD_SET(sigpipe_fds[0], &master);
+  int fdmax = sockfd; // highest-numbered fd we know about
+  if (sigpipe_fds[0] > fdmax)
+    fdmax = sigpipe_fds[0];
 
   while (1) {
     readfds = master;
@@ -149,6 +168,20 @@ int main(int argc, char **argv) {
         continue;
       perror("select");
       break;
+    }
+
+    // Did a signal wake us?
+    if (FD_ISSET(sigpipe_fds[0], &readfds)) {
+      // drain the pipe
+      uint8_t buf[64];
+      while (read(sigpipe_fds[0], buf, sizeof buf) > 0) {
+      }
+      --nready;
+
+      if (!running) {
+        // fall out of the loop to clean up
+        break;
+      }
     }
 
     if (FD_ISSET(sockfd, &readfds)) { // if sockfd is readable? as in is there a client pending
@@ -164,7 +197,7 @@ int main(int argc, char **argv) {
           fdmax = new_fd;
 
         const char *banner = "Welcome!\n";
-        send(new_fd, banner, strlen(banner), 0);
+        sendall(new_fd, banner, strlen(banner));
       }
       if (--nready == 0) {
         continue;
@@ -173,6 +206,8 @@ int main(int argc, char **argv) {
 
     for (int fd = 0; fd <= fdmax && nready > 0; ++fd) {
       if (fd == sockfd)
+        continue;
+      if (fd == sigpipe_fds[0] || fd == sigpipe_fds[1])
         continue;
       if (clients[fd].fd == -1)
         continue;
@@ -190,6 +225,7 @@ int main(int argc, char **argv) {
         clients[fd].line_len = 0;
         continue;
       }
+
       if (r < 0) {
         if (errno == EINTR)
           continue;
@@ -198,6 +234,7 @@ int main(int argc, char **argv) {
         FD_CLR(fd, &master);
         clients[fd].fd = -1;
         clients[fd].line_len = 0;
+        continue;
       }
 
       size_t off = 0;
@@ -239,4 +276,25 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  for (int fd = 0; fd <= fdmax; ++fd) {
+    if (fd == sigpipe_fds[0] || fd == sigpipe_fds[1])
+      continue;
+    if (fd == sockfd)
+      continue;
+    if (clients[fd].fd != -1) {
+      close(fd);
+      clients[fd].fd = -1;
+      clients[fd].line_len = 0;
+    }
+  }
+
+  if (sockfd >= 0)
+    close(sockfd);
+  if (sigpipe_fds[0] != -1)
+    close(sigpipe_fds[0]);
+  if (sigpipe_fds[1] != -1)
+    close(sigpipe_fds[1]);
+  fprintf(stderr, "server: shut down gracefully.\n");
+  return 0;
 }
