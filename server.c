@@ -24,6 +24,7 @@ static int sigpipe_fds[2] = {-1, -1};     // [0]=read end, [1]=write end
 static void on_signal(int signo) {
   (void)signo;
   running = 0;
+
   // wake select(): write one byte (async-signal-safe)
   if (sigpipe_fds[1] != -1) {
     const uint8_t b = 1;
@@ -58,6 +59,7 @@ struct client_state {
   int fd;
   char linebuf[BUFSZ * 2];
   size_t line_len;
+  char who[64];
 };
 
 static struct client_state clients[FD_SETSIZE];
@@ -66,6 +68,29 @@ static void clients_init(void) {
   for (int i = 0; i < FD_SETSIZE; ++i) {
     clients[i].fd = -1;
     clients[i].line_len = 0;
+    clients[i].who[0] = '\0';
+  }
+}
+
+static void broadcast_line(fd_set *master, int fdmax, const char *msg, int from_fd,
+                           int include_sender) {
+  for (int fd = 0; fd <= fdmax; ++fd) {
+    // skip non-clients
+    if (clients[fd].fd == -1)
+      continue;
+
+    // optionally skip the sender
+    if (!include_sender && fd == from_fd)
+      continue;
+
+    if (sendall(fd, msg, strlen(msg)) < 0) {
+      perror("send (broadcast)");
+      // if a send fails, close and remove this client
+      close(fd);
+      FD_CLR(fd, master);
+      clients[fd].fd = -1;
+      clients[fd].line_len = 0;
+    }
   }
 }
 
@@ -196,6 +221,10 @@ int main(int argc, char **argv) {
         if (new_fd > fdmax)
           fdmax = new_fd;
 
+        void *addr = (ss.ss_family == AF_INET) ? (void *)&((struct sockaddr_in *)&ss)->sin_addr
+                                               : (void *)&((struct sockaddr_in6 *)&ss)->sin6_addr;
+        inet_ntop(ss.ss_family, addr, clients[new_fd].who, sizeof clients[new_fd].who);
+
         const char *banner = "Welcome!\n";
         sendall(new_fd, banner, strlen(banner));
       }
@@ -256,20 +285,13 @@ int main(int argc, char **argv) {
         if (clients[fd].line_len && clients[fd].linebuf[clients[fd].line_len - 1] == '\n') {
           rstrip_crlf(clients[fd].linebuf);
 
-          printf("%d: \"%s\"\n", fd, clients[fd].linebuf);
+          printf("%s (fd=%d): \"%s\"\n", clients[fd].who, fd, clients[fd].linebuf);
           fflush(stdout);
 
           char out[BUFSZ + 128];
-          int m = snprintf(out, sizeof out, "Broadcast: %s\n", clients[fd].linebuf);
+          int m = snprintf(out, sizeof out, "%s: %s\n", clients[fd].who, clients[fd].linebuf);
           if (m > 0) {
-            if (send(fd, out, (size_t)m, 0) < 0) {
-              perror("send");
-              close(fd);
-              FD_CLR(fd, &master);
-              clients[fd].fd = -1;
-              clients[fd].line_len = 0;
-              break; // stop handling this fd this tick
-            }
+            broadcast_line(&master, fdmax, out, fd, 1);
           }
           clients[fd].line_len = 0; // ready for next line
         }
@@ -286,6 +308,7 @@ int main(int argc, char **argv) {
       close(fd);
       clients[fd].fd = -1;
       clients[fd].line_len = 0;
+      clients[fd].who[0] = '\0';
     }
   }
 
