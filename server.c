@@ -32,6 +32,15 @@ static void on_signal(int signo) {
   }
 }
 
+static int set_nonblock(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags == -1)
+    return -1;
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
+    return -1;
+  return 0;
+}
+
 static ssize_t sendall(int fd, const void *buf, size_t len) {
   const char *p = buf;
   size_t sent = 0;
@@ -151,6 +160,11 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (set_nonblock(sockfd) == -1) {
+    perror("set_nonblock");
+    return 1;
+  }
+
   printf("server: Listening on port %s \n", argv[1]);
 
   // create self-pipe
@@ -209,11 +223,17 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (FD_ISSET(sockfd, &readfds)) { // if sockfd is readable? as in is there a client pending
+    // if sockfd is readable? as in is there a client pending
+    if (FD_ISSET(sockfd, &readfds)) {
       struct sockaddr_storage ss;
       socklen_t slen = sizeof ss;
       int new_fd = accept(sockfd, (struct sockaddr *)&ss, &slen);
       if (new_fd != -1) {
+        if (set_nonblock(new_fd) == -1) {
+          perror("set_nonblock(new_fd)");
+          close(new_fd);
+          continue;
+        }
         clients[new_fd].fd = new_fd;
         clients[new_fd].line_len = 0;
 
